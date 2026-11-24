@@ -50,6 +50,10 @@ export class Master {
     private pollsRunning = 0;
     private pulseList: { [id: string]: ioBroker.StateValue } = {};
     private sendBuffer: { [id: string]: ioBroker.StateValue } = {};
+    /** True while #send() works off the sendBuffer, so only one write is on the way at a time */
+    private sending = false;
+    /** When the last write was done, to keep "Write interval" also between writes that come one by one */
+    private lastWrite = 0;
     private readonly devices: Options['devices'];
     private readonly deviceIds: number[];
     private reconnectTimeout: ioBroker.Timeout | undefined;
@@ -1387,29 +1391,43 @@ export class Master {
         }
     }
 
+    /**
+     * Writes the values of the sendBuffer one after another. Only one call works at a time: a write that comes in
+     * meanwhile is taken by the running loop. "Write interval" is kept between two writes, also when the second one
+     * comes after the buffer was empty.
+     */
     async #send(): Promise<void> {
-        if (!this.modbusClient) {
-            this.adapter.log.error('Client not connected');
+        if (this.sending) {
             return;
         }
+        this.sending = true;
+        try {
+            while (!this.isStop && Object.keys(this.sendBuffer).length) {
+                if (!this.modbusClient) {
+                    this.adapter.log.error('Client not connected');
+                    return;
+                }
+                const wait = (this.options.config.writeInterval || 0) - (Date.now() - this.lastWrite);
+                if (wait > 0) {
+                    await this.#waitAsync(wait);
+                }
 
-        const id = Object.keys(this.sendBuffer)[0];
-        const val = this.sendBuffer[id];
-        delete this.sendBuffer[id];
+                // taken after the wait, so a value written meanwhile to the same register is the one sent
+                const id = Object.keys(this.sendBuffer)[0];
+                const val = this.sendBuffer[id];
+                delete this.sendBuffer[id];
 
-        await this.#writeValue(id, val);
-
-        if (Object.keys(this.sendBuffer).length) {
-            this.adapter.setTimeout(() => this.#send(), this.options.config.writeInterval || 0);
+                await this.#writeValue(id, val);
+                this.lastWrite = Date.now();
+            }
+        } finally {
+            this.sending = false;
         }
     }
 
     #writeHelper(id: string, state: ioBroker.SettableState): void {
         this.sendBuffer[id] = state.val!;
-
-        if (Object.keys(this.sendBuffer).length === 1) {
-            this.#send().catch(e => this.adapter.log.error(`Cannot send: ${e}`));
-        }
+        this.#send().catch(e => this.adapter.log.error(`Cannot send: ${e}`));
     }
 
     async write(id: string, state: ioBroker.State): Promise<void> {

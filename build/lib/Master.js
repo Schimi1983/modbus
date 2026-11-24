@@ -1,0 +1,1332 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Master = void 0;
+const common_1 = require("./common");
+const modbus_client_serial_1 = __importDefault(require("./modbus/transports/modbus-client-serial"));
+const modbus_client_tcp_1 = __importDefault(require("./modbus/transports/modbus-client-tcp"));
+const modbus_client_udp_1 = __importDefault(require("./modbus/transports/modbus-client-udp"));
+const modbus_client_tcp_rtu_1 = __importDefault(require("./modbus/transports/modbus-client-tcp-rtu"));
+const modbus_client_tcp_ssl_1 = __importDefault(require("./modbus/transports/modbus-client-tcp-ssl"));
+const loggingUtils_1 = require("./loggingUtils");
+const usedResources_1 = require("./usedResources");
+class Master {
+    modbusClient;
+    connected = false;
+    connectTimer;
+    nextPoll;
+    pollTime;
+    errorCount = 0;
+    ackObjects = {};
+    objects;
+    isStop = false;
+    /**
+     * Number of operations (block reads / writes) currently being retried. While > 0 the auto-poll that a retry
+     * reconnect would otherwise start is suppressed, so only the operation(s) under retry are re-sent and no
+     * competing polling cycle starts (avoids two overlapping cycles, cf. issue #595). A counter rather than a
+     * boolean because reads and writes retry independently and can overlap: one finishing must not clear the flag
+     * while another is still running.
+     */
+    activeRetries = 0;
+    /**
+     * True while the underlying connection is known to be dead (a disconnect/close/error event fired) and a
+     * reconnect has not yet re-established it. Drives the "reconnect only when needed" decision in the retry
+     * logic: a pure timeout leaves this false, so retries cheaply resend on the same socket; only an actually-
+     * dropped session triggers a reconnect. Reset to false by the `connect` handler.
+     */
+    sessionDead = false;
+    /**
+     * A reconnect was requested by an event handler (timeout, socket error, no device answers) while a retry
+     * sequence was running. The retry reconnects before its next attempt; if no retry is left, the reconnect is
+     * done when the last sequence ends. Without this, e.g. a serial client stays in the `error` state after a
+     * timeout and every following request would wait in its queue forever.
+     */
+    reconnectRequested = false;
+    /**
+     * With keepConnectionOnTimeout: no polled device answered during a retry sequence. The retry still resends on
+     * the open socket, but if its last attempt fails too, the connection is re-established afterwards.
+     */
+    silentDuringRetry = false;
+    /** Number of running polling cycles, so a reconnect during a retry restarts the polling only if none runs */
+    pollsRunning = 0;
+    pulseList = {};
+    sendBuffer = {};
+    /** True while #send() works off the sendBuffer, so only one write is on the way at a time */
+    sending = false;
+    /** When the last write was done, to keep "Write interval" also between writes that come one by one */
+    lastWrite = 0;
+    devices;
+    deviceIds;
+    reconnectTimeout;
+    keepAliveTimeout;
+    adapter;
+    options;
+    scaleFactors = {};
+    lastValidValues = {};
+    /**
+     * The serial port this master holds while it is connected. Only serial occupies something on
+     * this host - over TCP, UDP or SSL the endpoint belongs to the device on the other side.
+     */
+    usedSerialPort;
+    /**
+     * A timeout fails only its request, the connection stays open (issue #832). Only over TCP, SSL and
+     * UDP with the transaction ID checked: there a late answer to the timed out request is dropped.
+     */
+    keepConnectionOnTimeout;
+    showDebug;
+    /** Optional bridge callback (proxy mode): invoked after each polled value is written to its state */
+    onUpdate;
+    constructor(options, adapter) {
+        this.adapter = adapter;
+        this.options = options;
+        this.devices = options.devices;
+        this.objects = options.objects;
+        this.deviceIds = Object.keys(options.devices).map(id => parseInt(id, 10));
+        this.showDebug = adapter.common?.loglevel === 'debug' || adapter.common?.loglevel === 'silly';
+        const type = options.config.type;
+        const transactionIdChecked = (type === 'tcp' || type === 'udp' || type === 'tcp-ssl') && !options.config.ignoreTransactionId;
+        this.keepConnectionOnTimeout = !!options.config.keepConnectionOnTimeout && transactionIdChecked;
+        if (options.config.keepConnectionOnTimeout && !transactionIdChecked) {
+            adapter.log.warn(options.config.ignoreTransactionId
+                ? '"keepConnectionOnTimeout" is ignored together with "ignoreTransactionId": a late answer could be taken for the next request'
+                : `"keepConnectionOnTimeout" is only supported over TCP, SSL and UDP, not with "${type}"`);
+        }
+        void adapter.setState('info.connection', false, true);
+        // delete all server connection information
+        void adapter.getStatesAsync('info.clients.*').then(async (states) => {
+            for (const id in states) {
+                await adapter.delForeignObjectAsync(id);
+            }
+        });
+        if (options.config.type === 'tcp') {
+            const tcp = options.config.tcp;
+            if (!tcp || !tcp.ip || tcp.ip === '0.0.0.0') {
+                adapter.log.error('IP address is not defined');
+                return;
+            }
+            try {
+                const logWrapper = (0, loggingUtils_1.createLoggingWrapper)(adapter.log, options.config.disableLogging);
+                this.modbusClient = new modbus_client_tcp_1.default({
+                    tcp: {
+                        host: tcp.ip,
+                        port: tcp.port || 502,
+                        autoReconnect: false,
+                    },
+                    logger: logWrapper,
+                    timeout: options.config.timeout,
+                    deviceTimeouts: options.config.deviceTimeouts,
+                    unitId: options.config.defaultDeviceId,
+                    ignoreTransactionId: options.config.ignoreTransactionId,
+                    keepConnectionOnTimeout: this.keepConnectionOnTimeout,
+                });
+            }
+            catch (e) {
+                adapter.log.error(`Cannot connect to "${tcp.ip}:${tcp.port || 502}": ${e}`);
+            }
+        }
+        else if (options.config.type === 'udp') {
+            const tcp = options.config.tcp;
+            if (!tcp || !tcp.ip || tcp.ip === '0.0.0.0') {
+                adapter.log.error('IP address is not defined');
+                return;
+            }
+            try {
+                const logWrapper = (0, loggingUtils_1.createLoggingWrapper)(adapter.log, options.config.disableLogging);
+                this.modbusClient = new modbus_client_udp_1.default({
+                    udp: {
+                        host: tcp.ip,
+                        port: tcp.port || 502,
+                        autoReconnect: false,
+                    },
+                    logger: logWrapper,
+                    timeout: options.config.timeout,
+                    deviceTimeouts: options.config.deviceTimeouts,
+                    unitId: options.config.defaultDeviceId,
+                    ignoreTransactionId: options.config.ignoreTransactionId,
+                    keepConnectionOnTimeout: this.keepConnectionOnTimeout,
+                });
+            }
+            catch (e) {
+                adapter.log.error(`Cannot connect to "${tcp.ip}:${tcp.port || 502}" (UDP): ${e}`);
+            }
+        }
+        else if (options.config.type === 'tcp-ssl') {
+            const tcp = options.config.tcp;
+            if (!tcp?.ip || tcp.ip === '0.0.0.0') {
+                adapter.log.error('IP address is not defined');
+                return;
+            }
+            try {
+                const logWrapper = (0, loggingUtils_1.createLoggingWrapper)(adapter.log, options.config.disableLogging);
+                if (!options.config.ssl?.cert || !options.config.ssl?.key) {
+                    adapter.log.error('SSL certificate or key is not defined');
+                    return;
+                }
+                // Prepare SSL configuration
+                const sslConfig = {
+                    rejectUnauthorized: options.config.ssl?.rejectUnauthorized !== false,
+                    cert: options.config.ssl.cert,
+                    key: options.config.ssl.key,
+                    ca: options.config.ssl.ca,
+                };
+                this.modbusClient = new modbus_client_tcp_ssl_1.default({
+                    tcp: {
+                        host: tcp.ip,
+                        port: tcp.port || 502,
+                        autoReconnect: false,
+                    },
+                    ssl: sslConfig,
+                    logger: logWrapper,
+                    timeout: options.config.timeout,
+                    deviceTimeouts: options.config.deviceTimeouts,
+                    unitId: options.config.defaultDeviceId,
+                    ignoreTransactionId: options.config.ignoreTransactionId,
+                    keepConnectionOnTimeout: this.keepConnectionOnTimeout,
+                });
+            }
+            catch (e) {
+                adapter.log.error(`Cannot connect to SSL "${tcp.ip}:${tcp.port || 502}": ${e}`);
+            }
+        }
+        else if (options.config.type === 'tcprtu') {
+            const tcp = options.config.tcp;
+            if (!tcp?.ip || tcp.ip === '0.0.0.0') {
+                adapter.log.error('IP address is not defined');
+                return;
+            }
+            try {
+                const logWrapper = (0, loggingUtils_1.createLoggingWrapper)(adapter.log, options.config.disableLogging);
+                this.modbusClient = new modbus_client_tcp_rtu_1.default({
+                    tcp: {
+                        host: tcp.ip,
+                        port: tcp.port || 502,
+                        autoReconnect: false,
+                    },
+                    logger: logWrapper,
+                    timeout: options.config.timeout,
+                    deviceTimeouts: options.config.deviceTimeouts,
+                    unitId: options.config.defaultDeviceId,
+                });
+            }
+            catch (e) {
+                adapter.log.error(`Cannot connect to "${tcp.ip}:${tcp.port || 502}": ${e}`);
+            }
+        }
+        else if (options.config.type === 'serial') {
+            const serial = options.config.serial;
+            if (!serial || !serial.comName) {
+                adapter.log.error('Serial device name is not defined');
+                return;
+            }
+            this.usedSerialPort = { port: serial.comName, baudRate: serial.baudRate || 9600 };
+            // Who else declared this port? Asked before it is opened - afterwards the operating
+            // system has decided it, and "Resource temporarily unavailable" does not name the
+            // instance that got there first
+            void (0, usedResources_1.reportResourceConflict)(adapter, 'serialPort', this.usedSerialPort, 'the master');
+            try {
+                const logWrapper = (0, loggingUtils_1.createLoggingWrapper)(adapter.log, options.config.disableLogging);
+                this.modbusClient = new modbus_client_serial_1.default({
+                    serial: {
+                        portName: serial.comName,
+                        baudRate: serial.baudRate || 9600,
+                        dataBits: serial.dataBits || 8,
+                        stopBits: serial.stopBits || 1,
+                        parity: serial.parity || 'none',
+                    },
+                    logger: logWrapper,
+                    timeout: options.config.timeout,
+                    deviceTimeouts: options.config.deviceTimeouts,
+                    unitId: options.config.multiDeviceId ? undefined : options.config.defaultDeviceId,
+                });
+            }
+            catch (e) {
+                adapter.log.error(`Cannot open port "${serial.comName}" [${serial.baudRate || 9600}]: ${e}`);
+            }
+        }
+        else {
+            adapter.log.error(`Unsupported type ${options.config.type}"`);
+            return;
+        }
+        if (!this.modbusClient) {
+            adapter.log.error('Cannot create modbus master!');
+            return;
+        }
+        this.modbusClient
+            .on('connect', () => {
+            this.sessionDead = false;
+            // a fresh connection fulfils a reconnect that was requested before
+            this.reconnectRequested = false;
+            this.silentDuringRetry = false;
+            if (!this.connected) {
+                if (options.config.type === 'tcp' || options.config.type === 'udp') {
+                    adapter.log.info(`Connected to slave ${options.config.tcp?.ip}`);
+                }
+                else {
+                    adapter.log.info('Connected to slave');
+                }
+                this.connected = true;
+                void this.adapter.setState('info.connection', true, true);
+            }
+            if (this.usedSerialPort) {
+                // Reported only now: a serial port that could not be opened is not held by this
+                // instance, and the host must not list it as taken
+                void (0, usedResources_1.registerUsedResource)(this.adapter, 'serialPort', this.usedSerialPort);
+            }
+            if (this.nextPoll) {
+                adapter.clearTimeout(this.nextPoll);
+                this.nextPoll = null;
+            }
+            // The `close` event of the socket that was dropped on purpose can arm a new reconnect
+            // right after `#reconnect()` cleared it. We are connected again, so that timer would
+            // only tear the fresh connection down — and until it fires, `#pollInterrupted` would
+            // abort the cycle started below before it sends its first request.
+            if (this.reconnectTimeout) {
+                adapter.clearTimeout(this.reconnectTimeout);
+                this.reconnectTimeout = null;
+            }
+            // A reconnect that is part of a retry sequence must not start a second polling cycle - the
+            // running cycle (which is re-sending the failed read) continues on its own. But a reconnect for
+            // a write retry clears the timer of the next poll, so the polling is started if no cycle runs.
+            if (this.activeRetries === 0 || !this.pollsRunning) {
+                void this.#poll().catch(err => this.adapter.log.error(err));
+            }
+            this.keepAliveTimeout && adapter.clearTimeout(this.keepAliveTimeout);
+            this.keepAliveTimeout = adapter.setTimeout(() => {
+                this.keepAliveTimeout = undefined;
+                this.#pollBinariesBlockWithKeepAlive();
+            }, options.config.keepAliveInterval || 1000);
+        })
+            .on('disconnect', () => {
+            this.sessionDead = true;
+            if (this.isStop) {
+                return;
+            }
+            this.#scheduleAutoReconnect();
+        });
+        this.modbusClient.on('close', () => {
+            this.sessionDead = true;
+            if (this.usedSerialPort) {
+                // The port is closed - unplugged, or given up before a reconnect - so it is free
+                // again until the `connect` above gets it back
+                void (0, usedResources_1.freeUsedResource)(this.adapter, 'serialPort', { port: this.usedSerialPort.port });
+            }
+            if (this.isStop) {
+                return;
+            }
+            this.#scheduleAutoReconnect();
+        });
+        this.modbusClient.on('error', err => {
+            this.sessionDead = true;
+            if (this.isStop) {
+                return;
+            }
+            if (err.code === 'ECONNREFUSED') {
+                adapter.log.warn(`Connection refused ${err.address}:${err.port}`);
+            }
+            else {
+                adapter.log.warn(`On error: ${(0, common_1.formatError)(err)}`);
+            }
+            this.#scheduleAutoReconnect();
+        });
+        this.modbusClient.on('trashCurrentRequest', (info) => {
+            if (this.isStop) {
+                return;
+            }
+            // Name the dropped request: it is the one the device did not answer (issue #811). While a retry
+            // sequence runs, the retry logs the attempt itself (at info level) and reconnects before it.
+            const text = `Request cancelled (${info?.reason || 'unknown reason'})${info?.request ? `: ${info.request}` : ''}`;
+            if (this.activeRetries > 0) {
+                adapter.log.debug(text);
+            }
+            else {
+                adapter.log.warn(`${text}, reconnecting`);
+            }
+            this.#scheduleAutoReconnect();
+        });
+        // Only with keepConnectionOnTimeout: the request failed, but the connection stays open - unless
+        // no polled device answers anymore, then the connection itself is probably gone (issue #832)
+        this.modbusClient.on('requestTimeout', (info) => {
+            if (this.isStop || !this.#allDevicesSilent(info?.silentUnits)) {
+                return;
+            }
+            if (this.activeRetries > 0) {
+                // the retry resends on the open socket and reconnects only if its last attempt fails too
+                this.silentDuringRetry = true;
+                return;
+            }
+            adapter.log.warn('No device answers anymore, reconnecting');
+            this.#scheduleAutoReconnect();
+        });
+    }
+    /** True if every polled device timed out since the last answer of any device */
+    #allDevicesSilent(silentUnits) {
+        if (!silentUnits?.length) {
+            return false;
+        }
+        return this.deviceIds.every(id => silentUnits.includes(id));
+    }
+    /**
+     * True as soon as the current polling cycle must not issue any further requests: a reconnect is
+     * already pending (the request FIFO has been trashed), the client is disconnected, or the master
+     * is shutting down. Requests queued after that point survive the cleanup and would be replayed on
+     * the reconnected socket, in parallel to the fresh cycle started by the `connect` handler.
+     */
+    get #pollInterrupted() {
+        return !!this.reconnectTimeout || !this.connected || this.isStop;
+    }
+    /** Warning for a block that could not be read. An incomplete response gets a hint how to fix the configuration */
+    #blockErrorText(deviceId, regType, regBlock, err) {
+        const text = `[DevID_${deviceId}/${regType}] Block ${regBlock.start}-${regBlock.start + regBlock.count - 1}: ${(0, common_1.formatError)(err)}`;
+        if (err?.incomplete) {
+            return (`${text}. The block is discarded. Some addresses in this block may not exist on the device - reduce ` +
+                `"Max block size" or set "Max address gap to combine" to 0 (issues #502/#581).`);
+        }
+        return text;
+    }
+    #waitAsync(ms) {
+        if (!ms) {
+            return Promise.resolve();
+        }
+        return new Promise(resolve => this.adapter.setTimeout(resolve, ms));
+    }
+    /** True for failures worth re-attempting: an expired timeout or a dropped connection (and nothing else). */
+    #isRetryable(err) {
+        if (!err || typeof err !== 'object') {
+            return false;
+        }
+        const e = err;
+        // Only a resend can fix an expired request timeout or a dropped connection. A Modbus exception, or an
+        // incomplete/invalid response (wrong length/address), is a definitive answer from the device - resending
+        // it fails identically, so it is not retried.
+        return e.timeout !== undefined || e.message?.includes('connection closed') === true;
+    }
+    /**
+     * Schedule an automatic reconnect unless a retry sequence is currently driving reconnection itself. While any
+     * operation is being retried (`activeRetries > 0`), the retry logic owns the connection and must not be raced by
+     * these event handlers - otherwise a stray `#reconnect()` would tear down the very socket a retry just opened.
+     */
+    #scheduleAutoReconnect() {
+        if (this.activeRetries > 0) {
+            this.reconnectRequested = true;
+            return;
+        }
+        this.reconnectTimeout ||= this.adapter.setTimeout(() => this.#reconnect(), 1000);
+    }
+    /**
+     * Re-establish the (dead) connection and wait until we are connected again, so a retry has a live socket to
+     * send on. Bounded by a deadline so an unreachable device cannot stall the polling cycle.
+     */
+    async #reconnectForRetry() {
+        // A connection that is being established (the first connect, or a reconnect that is already scheduled)
+        // is only awaited: tearing it down would abort it and cost the attempt
+        const connecting = !this.sessionDead &&
+            !this.reconnectRequested &&
+            (!!this.connectTimer || !!this.modbusClient?.inState('connect'));
+        if (!connecting) {
+            this.#reconnect(true);
+        }
+        const deadline = Date.now() + 5000;
+        while (!this.isStop && !this.connected) {
+            if (Date.now() > deadline) {
+                break;
+            }
+            await this.#waitAsync(20);
+        }
+    }
+    /**
+     * Perform an operation, re-attempting it up to `maxRetries` times when it fails with a timeout or
+     * connection loss. Each retry is logged as `[retry/k/N]...` and re-sends the same request on the existing
+     * socket (a cheap resend); the connection is only torn down and re-established if it actually dropped
+     * (`sessionDead`). Returns the first successful result, or throws the last error once every attempt (or a
+     * non-retryable device exception) fails. `errorText` renders one log line for a failed attempt.
+     */
+    async #retryable(maxRetries, errorText, doOp) {
+        // Authoritative bound on retries (the admin allows 0..3): even a direct lib caller passing a larger count is
+        // capped here, so one silent device cannot stall the polling cycle for long (issue #432).
+        const max = Math.min(3, Math.max(0, Math.floor(Number(maxRetries) || 0)));
+        if (max <= 0) {
+            return await doOp();
+        }
+        // A retry sequence owns reconnection while active: the automatic reconnect handlers are suppressed
+        // (#scheduleAutoReconnect) and a `connect` starts a polling cycle only if none runs, so the failed
+        // operation is re-sent and no competing polling cycle starts.
+        const retryInterval = this.options.config.retryInterval ?? 100;
+        this.activeRetries += 1;
+        // set when the last attempt failed: the socket is dead, or (keepConnectionOnTimeout) no device answers
+        let deadSocket = false;
+        let silent = false;
+        try {
+            let attempt = 0;
+            for (;;) {
+                try {
+                    // Ensure a live socket before sending: reconnect only when the session actually dropped.
+                    // A pure timeout leaves `sessionDead` false, so we cheaply resend on the same socket.
+                    if (!this.connected || this.sessionDead || this.reconnectRequested) {
+                        await this.#reconnectForRetry();
+                    }
+                    // A retry must have a live socket; if reconnection did not bring one up, fail fast (instead
+                    // of queueing into a dead FIFO that would never be flushed) and count it as an attempt.
+                    if (attempt > 0 && !this.connected) {
+                        throw new Error('no connection for retry');
+                    }
+                    const result = await doOp();
+                    // the device answered, so the connection is alive
+                    this.silentDuringRetry = false;
+                    return result;
+                }
+                catch (err) {
+                    const retryable = this.#isRetryable(err);
+                    if (!retryable || attempt >= max) {
+                        // A dead-socket failure needs the connection torn down and re-established; a Modbus
+                        // exception or a pure timeout on a live socket left it healthy, so only clean up then.
+                        if (retryable) {
+                            deadSocket = !this.connected || this.sessionDead || this.reconnectRequested;
+                            silent = this.silentDuringRetry;
+                        }
+                        throw err;
+                    }
+                    attempt += 1;
+                    this.adapter.log.info(`[retry/${attempt}/${max}]${errorText(err)}`);
+                    // Cheap resend: settle briefly on the same socket (the read timeout already spaces silent
+                    // attempts); a dropped session is re-established at the top of the next iteration.
+                    await this.#waitAsync(retryInterval);
+                }
+            }
+        }
+        finally {
+            this.activeRetries -= 1;
+            if (this.isStop) {
+                // nothing to do
+            }
+            else if (this.activeRetries) {
+                // Another sequence is running: tearing the socket down now would cost it an attempt that never
+                // reaches the device. It reconnects before its next attempt, or after its last one if all fail.
+                if (deadSocket) {
+                    this.reconnectRequested = true;
+                }
+            }
+            else if (deadSocket || silent || this.reconnectRequested) {
+                if (silent && !deadSocket) {
+                    this.adapter.log.warn('No device answers anymore, reconnecting');
+                }
+                this.#reconnect(true);
+            }
+        }
+    }
+    /**
+     * Perform a single register-block read, re-attempting it up to `readRetryCount` times when it fails with a
+     * timeout or connection loss. See {@link #retryable} for the retry semantics.
+     */
+    async #readWithRetry(deviceId, regType, regBlock, doRead) {
+        return this.#retryable(this.options.config.readRetryCount ?? 0, err => this.#blockErrorText(deviceId, regType, regBlock, err), doRead);
+    }
+    #reconnect(isImmediately) {
+        this.reconnectRequested = false;
+        this.silentDuringRetry = false;
+        if (this.reconnectTimeout) {
+            this.adapter.clearTimeout(this.reconnectTimeout);
+            this.reconnectTimeout = null;
+        }
+        if (this.nextPoll) {
+            this.adapter.clearTimeout(this.nextPoll);
+            this.nextPoll = null;
+        }
+        if (this.keepAliveTimeout) {
+            this.adapter.clearTimeout(this.keepAliveTimeout);
+            this.keepAliveTimeout = null;
+        }
+        try {
+            this.modbusClient?.close();
+        }
+        catch (e) {
+            this.adapter.log.error(`Cannot close master: ${e}`);
+        }
+        if (this.connected) {
+            if (this.options.config.tcp) {
+                this.adapter.log.info(`Disconnected from slave ${this.options.config.tcp?.ip}`);
+            }
+            else {
+                this.adapter.log.info('Disconnected from slave');
+            }
+            this.connected = false;
+            void this.adapter.setState('info.connection', false, true);
+        }
+        this.connectTimer ||= this.adapter.setTimeout(() => {
+            this.connectTimer = null;
+            if (typeof this.modbusClient?.connect === 'function') {
+                this.modbusClient.connect();
+            }
+        }, isImmediately ? 1000 : this.options.config.recon);
+    }
+    async #pollBinariesBlock(device, regType, block) {
+        const regs = device[regType];
+        const regBlock = regs.blocks[block];
+        if (regBlock.startIndex === regBlock.endIndex) {
+            regBlock.endIndex++;
+        }
+        if (this.showDebug) {
+            this.adapter.log.debug(`[DevID_${regs.deviceId}/${regType}] Poll address ${regBlock.start} - ${regBlock.count} bits`);
+        }
+        if (this.modbusClient && this.connected && !this.isStop) {
+            const modbus = this.modbusClient;
+            let response;
+            try {
+                response = await this.#readWithRetry(regs.deviceId, regType, regBlock, () => regType === 'disInputs'
+                    ? modbus.readDiscreteInputs(regs.deviceId, regBlock.start, regBlock.count)
+                    : modbus.readCoils(regs.deviceId, regBlock.start, regBlock.count));
+            }
+            catch (err) {
+                this.adapter.log.warn(this.#blockErrorText(regs.deviceId, regType, regBlock, err));
+                // Only abort the whole cycle when the connection itself is gone. A plain Modbus
+                // exception response (illegal address, illegal function, device busy) leaves the
+                // socket intact, so the remaining blocks of this register type must still be read
+                // - otherwise a single register the device rejects would permanently hide every
+                // block behind it.
+                if (this.#pollInterrupted) {
+                    throw err;
+                }
+                return;
+            }
+            if (response.data?.length) {
+                for (let n = regBlock.startIndex; n < regBlock.endIndex; n++) {
+                    const id = regs.config[n].id;
+                    const val = response.data[regs.config[n].address - regBlock.start];
+                    if (this.options.config.alwaysUpdate ||
+                        this.ackObjects[id] === undefined ||
+                        this.ackObjects[id].val !== val) {
+                        this.ackObjects[id] = { val };
+                        void this.adapter.setState(id, val, true, err => {
+                            // analyze if the state could be set (because of permissions)
+                            err && this.adapter.log.error(`Can not set state ${id}: ${err}`);
+                        });
+                        // Proxy bridge: mirror the polled value into the built-in slave server
+                        this.onUpdate?.(regs.config[n].fullId, val);
+                    }
+                }
+            }
+            else {
+                this.adapter.log.warn(`Null buffer length for ${regType} ${regBlock.start}`);
+            }
+        }
+        else {
+            this.adapter.log.debug(`Poll canceled, because no connection`);
+            throw new Error('No connection');
+        }
+    }
+    #pollBinariesBlockWithKeepAlive() {
+        if (this.options.config.keepAliveInterval > 0) {
+            if (this.keepAliveTimeout) {
+                this.keepAliveTimeout && this.adapter.clearTimeout(this.keepAliveTimeout);
+                this.keepAliveTimeout = null;
+            }
+            if (this.modbusClient) {
+                this.modbusClient
+                    .readDiscreteInputs(this.deviceIds[0], 0, 1)
+                    .then(response => this.adapter.log.silly(`Keep alive response = ${JSON.stringify(response)}`))
+                    .catch(() => { });
+                this.keepAliveTimeout = this.adapter.setTimeout(() => {
+                    this.keepAliveTimeout = null;
+                    this.#pollBinariesBlockWithKeepAlive();
+                }, this.options.config.keepAliveInterval);
+            }
+            else {
+                this.adapter.log.debug(`Poll canceled, because no connection`);
+            }
+        }
+        else {
+            this.adapter.log.silly('Keepalive is disabled!');
+        }
+    }
+    async #pollBinariesBlocks(device, regType) {
+        const regs = device[regType];
+        for (let n = 0; n < regs.blocks.length; n++) {
+            if (this.#pollInterrupted) {
+                break;
+            }
+            await this.#pollBinariesBlock(device, regType, n);
+            await this.#waitAsync(this.options.config.readInterval);
+        }
+    }
+    async #pollFloatBlock(device, regType, block) {
+        const regs = device[regType];
+        const regBlock = regs.blocks[block];
+        if (regBlock.startIndex === regBlock.endIndex) {
+            regBlock.endIndex++;
+        }
+        if (!this.scaleFactors[regs.deviceId]) {
+            this.adapter.log.debug('Initialization of scale factors done!');
+            this.scaleFactors[regs.deviceId] = {};
+        }
+        if (this.showDebug) {
+            this.adapter.log.debug(`[DevID_${regs.deviceId}/${regType}] Poll address ${regBlock.start} - ${regBlock.count} registers`);
+        }
+        if (this.modbusClient && this.connected && !this.isStop) {
+            const modbus = this.modbusClient;
+            let response;
+            try {
+                response = await this.#readWithRetry(regs.deviceId, regType, regBlock, () => regType === 'inputRegs'
+                    ? modbus.readInputRegisters(regs.deviceId, regBlock.start, regBlock.count)
+                    : modbus.readHoldingRegisters(regs.deviceId, regBlock.start, regBlock.count));
+                if (this.showDebug) {
+                    this.adapter.log.debug(`[DevID_${regs.deviceId}/${regType}] Poll address ${regBlock.start} DONE`);
+                }
+                // The client rejects a response with fewer registers than requested (issues #502/#829).
+                // Keep the guard for safety: decoding the part that fits could store another block's data.
+                if (response.payload && response.payload.length < regBlock.count * 2) {
+                    this.adapter.log.warn(this.#blockErrorText(regs.deviceId, regType, regBlock, {
+                        message: `device returned ${response.payload.length >> 1} of ${regBlock.count} requested registers`,
+                        incomplete: true,
+                    }));
+                }
+                else if (response.payload?.length) {
+                    // first process all the scale factor values inside the block
+                    for (let n = regBlock.startIndex; n < regBlock.endIndex; n++) {
+                        if (!regs.config[n].poll && regType === 'holdingRegs') {
+                            continue;
+                        }
+                        if (regs.config[n].isScale) {
+                            const prefixAddr = `DevID_${device.coils.deviceId}/${regType}/${regs.config[n]._address}`;
+                            try {
+                                let val = (0, common_1.extractValue)(regs.config[n].type, regs.config[n].len, response.payload, regs.config[n].address - regBlock.start);
+                                const formula = regs.config[n].formula;
+                                // If value must be calculated with formula
+                                if (formula) {
+                                    if (this.showDebug) {
+                                        this.adapter.log.debug(`[${prefixAddr}] _Input Value = ${val}`);
+                                        this.adapter.log.debug(`[${prefixAddr}] _Formula = ${formula}`);
+                                    }
+                                    try {
+                                        const scaleAddress = parseInt(formula.substring(formula.indexOf('sf[') + 3), 10);
+                                        if (scaleAddress !== null && !isNaN(scaleAddress)) {
+                                            this.adapter.log.warn(`[${prefixAddr}] Calculation of a scaleFactor which is based on another scaleFactor seems strange. Please check the config for address ${regs.config[n].address} !`);
+                                        }
+                                        // calculate value from formula or report an error
+                                        const func = new Function('x', 'sf', `return ${formula}`);
+                                        val = func(val, this.scaleFactors[regs.deviceId]);
+                                        if (typeof val === 'number') {
+                                            val =
+                                                Math.round(val * this.options.config.round) / this.options.config.round;
+                                        }
+                                    }
+                                    catch (e) {
+                                        this.adapter.log.warn(`[${prefixAddr}] Calculation: eval(${formula}) not possible: ${e}`);
+                                    }
+                                }
+                                else if (typeof val === 'number') {
+                                    // no formula used, so just scale with factor and offset
+                                    val = val * regs.config[n].factor + regs.config[n].offset;
+                                    val = Math.round(val * this.options.config.round) / this.options.config.round;
+                                }
+                                // store the finally calculated value as scaleFactor
+                                this.scaleFactors[regs.deviceId][regs.config[n]._address] = val;
+                                if (this.showDebug) {
+                                    this.adapter.log.debug(`[${prefixAddr}] Scale factor value stored from this address = ${val}`);
+                                }
+                            }
+                            catch (err) {
+                                this.adapter.log.error(`Can not set value for [DevID_${regs.deviceId}]: ${err.message}`);
+                            }
+                        }
+                    }
+                    // now process all values and store to the states
+                    for (let n = regBlock.startIndex; n < regBlock.endIndex; n++) {
+                        // Skip non-polled registers (e.g., cyclic-write-only) that may be in the config
+                        if (!regs.config[n].poll && regType === 'holdingRegs') {
+                            continue;
+                        }
+                        const id = regs.config[n].id;
+                        try {
+                            let val = (0, common_1.extractValue)(regs.config[n].type, regs.config[n].len, response.payload, regs.config[n].address - regBlock.start);
+                            // If value must be calculated with formula
+                            const prefixAddr = this.showDebug
+                                ? `DevID_${device.coils.deviceId}/${regType}/${regs.config[n]._address}`
+                                : '';
+                            if (regs.config[n].formula) {
+                                if (this.showDebug) {
+                                    this.adapter.log.debug(`[${prefixAddr}] Input Value = ${val}`);
+                                    this.adapter.log.debug(`[${prefixAddr}] Formula = ${regs.config[n].formula}`);
+                                }
+                                try {
+                                    if (this.showDebug) {
+                                        // scaleAddress is used only for debug output
+                                        const m = regs.config[n].formula.match(/sf\[(['"`\d]+)]/g);
+                                        m?.forEach(sf => {
+                                            const num = sf.match(/\d+/);
+                                            if (num) {
+                                                const scaleAddress = parseInt(num[0], 10);
+                                                if (scaleAddress !== null && !isNaN(scaleAddress)) {
+                                                    // it seems that the current formula uses a scaleFactor, therefore check the validity.
+                                                    // `sf[]` is keyed by `_address`, which differs from the read address
+                                                    // when aliases are used, so look the register up in this block (issue #829)
+                                                    let inBlock = false;
+                                                    for (let i = regBlock.startIndex; i < regBlock.endIndex; i++) {
+                                                        if (regs.config[i]._address === scaleAddress) {
+                                                            inBlock = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    this.adapter.log.debug(`[${prefixAddr}] Scale factor address is = ${scaleAddress}`);
+                                                    this.adapter.log.debug(`[${prefixAddr}] Scale factor address is inside current read range = ${inBlock}`);
+                                                    // check if the scaleFactor address is in the current read block or outside this block
+                                                    if (!inBlock) {
+                                                        // the scaleFactor address is not in the current read block. So it cannot be ensured that the values are in sync / valid
+                                                        this.adapter.log.warn(`[DevID_${device.coils.deviceId}/${regType}/${regs.config[n]._address}] The current range for reading the values was from address ${regs.config[regBlock.startIndex]._address} up to address ${regs.config[regBlock.endIndex - 1]._address}!`);
+                                                        this.adapter.log.warn(`[DevID_${device.coils.deviceId}/${regType}/${regs.config[n]._address}] Please make sure to configure the read process that both adresses are read in the same block!`);
+                                                        this.adapter.log.warn(`[DevID_${device.coils.deviceId}/${regType}/${regs.config[n]._address}] The used scaleFactor from address ${scaleAddress} is not inside the same read block as the parameter on address ${regs.config[n]._address}`);
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                    // calculate value from formula or report an error
+                                    const func = new Function('x', 'sf', `return ${regs.config[n].formula}`);
+                                    val = func(val, this.scaleFactors[regs.deviceId]);
+                                    if (this.showDebug) {
+                                        this.adapter.log.debug(`[${prefixAddr}] Calculation result = ${val}, type = ${typeof val}`);
+                                    }
+                                    // only do rounding in case the calculation result is a number
+                                    if (typeof val === 'number') {
+                                        val = Math.round(val * this.options.config.round) / this.options.config.round;
+                                    }
+                                }
+                                catch (e) {
+                                    this.adapter.log.warn(`[DevID_${device.coils.deviceId}/${regType}/${regs.config[n]._address}] Calculation: eval(${regs.config[n].formula}) not possible: ${e}`);
+                                }
+                            }
+                            else if (typeof val === 'number') {
+                                val = val * regs.config[n].factor + regs.config[n].offset;
+                                val = Math.round(val * this.options.config.round) / this.options.config.round;
+                                if (isNaN(val)) {
+                                    // ignore NaN results
+                                    val = null;
+                                }
+                            }
+                            // Apply sanitization if enabled
+                            if (this.options.config.enableSanitization &&
+                                regs.config[n].sanitize &&
+                                typeof val === 'number') {
+                                val = this.#sanitizeValue(id, val, regs.config[n]);
+                            }
+                            if (val !== null &&
+                                (this.options.config.alwaysUpdate ||
+                                    this.ackObjects[id] === undefined ||
+                                    this.ackObjects[id].val !== val)) {
+                                this.ackObjects[id] = { val };
+                                void this.adapter.setState(id, val, true, err => 
+                                // analyze if the state could be set (because of permissions)
+                                err && this.adapter.log.error(`Can not set state ${id}: ${err}`));
+                                // Proxy bridge: mirror the polled value into the built-in slave server
+                                this.onUpdate?.(regs.config[n].fullId, val);
+                            }
+                        }
+                        catch (err) {
+                            this.adapter.log.error(`Can not set value: ${err.message}`);
+                        }
+                    }
+                }
+                else {
+                    this.adapter.log.warn(`Null buffer length for ${regType} ${regBlock.start}`);
+                }
+                // special case for cyclic write (cw)
+                if (this.options.config.maxBlock < 2 && regs.config[regBlock.startIndex].cw) {
+                    // write immediately the current value
+                    const fullId = regs.config[regBlock.startIndex].fullId;
+                    await this.#writeFloatsReg(fullId);
+                }
+            }
+            catch (err) {
+                this.adapter.log.warn(this.#blockErrorText(regs.deviceId, regType, regBlock, err));
+                // Only abort the whole cycle when the connection itself is gone. A plain Modbus
+                // exception response (illegal address, illegal function, device busy) leaves the
+                // socket intact, so the remaining blocks of this register type must still be read
+                // - otherwise a single register the device rejects would permanently hide every
+                // block behind it.
+                if (this.#pollInterrupted) {
+                    throw err;
+                }
+                return;
+            }
+        }
+        else {
+            this.adapter.log.debug(`Poll canceled, because no connection`);
+            throw new Error('No connection');
+        }
+    }
+    /**
+     * Sanitize a register value: detect invalid values (NaN, Infinity, extreme floats, out-of-range)
+     * and apply the configured sanitization action.
+     */
+    #sanitizeValue(id, value, config) {
+        let invalid = false;
+        if (isNaN(value) || !isFinite(value)) {
+            invalid = true;
+        }
+        else {
+            // Check extreme float values (typical Modbus error values for 32-bit floats)
+            const MAX_FLOAT32 = 3.4e38;
+            if (value <= -MAX_FLOAT32 || value >= MAX_FLOAT32) {
+                invalid = true;
+            }
+        }
+        // Check min/max range
+        if (!invalid) {
+            const minVal = typeof config.minValidValue === 'string' ? parseFloat(config.minValidValue) : config.minValidValue;
+            const maxVal = typeof config.maxValidValue === 'string' ? parseFloat(config.maxValidValue) : config.maxValidValue;
+            if (minVal !== undefined && !isNaN(minVal) && value < minVal) {
+                invalid = true;
+            }
+            if (maxVal !== undefined && !isNaN(maxVal) && value > maxVal) {
+                invalid = true;
+            }
+        }
+        if (!invalid) {
+            // Value is valid — remember it
+            this.lastValidValues[id] = value;
+            return value;
+        }
+        // Value is invalid — apply sanitization action
+        const action = config.sanitizeAction || 'keepLastValid';
+        if (action === 'replaceWithZero') {
+            this.adapter.log.debug(`Sanitize: replacing invalid value for ${id} (${value}) with 0`);
+            return 0;
+        }
+        // keepLastValid
+        const lastValid = this.lastValidValues[id];
+        if (lastValid !== undefined) {
+            this.adapter.log.debug(`Sanitize: keeping last valid value for ${id}: ${lastValid} (got ${value})`);
+            return lastValid;
+        }
+        // No last valid value available — suppress update
+        this.adapter.log.debug(`Sanitize: no last valid value for ${id}, suppressing invalid value ${value}`);
+        return null;
+    }
+    async #pollFloatsBlocks(device, regType) {
+        const regs = device[regType];
+        for (let n = 0; n < regs.blocks.length; n++) {
+            if (this.#pollInterrupted) {
+                break;
+            }
+            await this.#pollFloatBlock(device, regType, n);
+            await this.#waitAsync(this.options.config.readInterval);
+        }
+    }
+    async #writeFloatsReg(fullId) {
+        const obj = this.objects[fullId];
+        if (obj?.native?.len) {
+            // `this.objects` (and so #writeValue) uses the full ID, the polled values and getStateAsync the ID
+            // without namespace. `obj._id` has no namespace, so it must not be cut (issue #771).
+            const id = fullId.substring(this.adapter.namespace.length + 1);
+            if (!this.modbusClient || !this.connected || this.isStop) {
+                throw new Error('client disconnected');
+            }
+            if (this.ackObjects[id]) {
+                await this.#writeValue(fullId, this.ackObjects[id].val);
+            }
+            else {
+                // For non-polled CW registers, read value from ioBroker state database
+                const state = await this.adapter.getStateAsync(id);
+                if (state?.val !== undefined && state?.val !== null) {
+                    await this.#writeValue(fullId, state.val);
+                }
+                else if (this.showDebug) {
+                    this.adapter.log.debug(`Cyclic write of ${fullId} skipped: the state has no value yet`);
+                }
+            }
+        }
+    }
+    async #writeFloatsRegs(fullIds) {
+        for (const fullId of fullIds) {
+            await this.#writeFloatsReg(fullId);
+            await this.#waitAsync(this.options.config.readInterval);
+        }
+    }
+    #pollResult(startTime, deviceId, err) {
+        if (err) {
+            this.errorCount++;
+            this.adapter.log.warn(`[DevID_${deviceId}] Poll error count: ${this.errorCount}: ${(0, common_1.formatError)(err)}`);
+            void this.adapter.setState('info.connection', false, true);
+            if (this.errorCount > 12 * this.deviceIds.length) {
+                // 2 re-connects did not help, restart adapter
+                this.adapter.log.error('Reconnect did not help, restart adapter');
+                typeof this.adapter.terminate === 'function' ? this.adapter.terminate(156) : process.exit(156);
+            }
+            else if (this.errorCount < 6 * this.deviceIds.length && this.connected) {
+                // tolerate up to 6 errors per device
+                return;
+            }
+            else {
+                return new Error('disconnect');
+            }
+        }
+        else {
+            const currentPollTime = new Date().valueOf() - startTime;
+            if (this.pollTime !== undefined) {
+                if (Math.abs(this.pollTime - currentPollTime) > 100) {
+                    this.pollTime = currentPollTime;
+                    void this.adapter.setState('info.pollTime', currentPollTime, true);
+                }
+            }
+            else {
+                this.pollTime = currentPollTime;
+                void this.adapter.setState('info.pollTime', currentPollTime, true);
+            }
+            if (this.errorCount > 0) {
+                void this.adapter.setState('info.connection', true, true);
+                this.errorCount = 0;
+            }
+        }
+    }
+    async #pollDevice(device) {
+        this.adapter.log.debug(`[DevID_${device.coils.deviceId}] Poll start ---------------------`);
+        const startTime = new Date().valueOf();
+        // Track errors from each register type but continue polling
+        const pollErrors = [];
+        let operations = 4;
+        // Poll discrete inputs
+        try {
+            await this.#pollBinariesBlocks(device, 'disInputs');
+        }
+        catch (err) {
+            if (this.#pollInterrupted) {
+                throw err;
+            }
+            pollErrors.push({ desc: 'pollBinariesBlocks', error: err });
+        }
+        // Poll coils
+        try {
+            await this.#pollBinariesBlocks(device, 'coils');
+        }
+        catch (err) {
+            if (this.#pollInterrupted) {
+                throw err;
+            }
+            pollErrors.push({ desc: 'pollBinariesBlocks', error: err });
+        }
+        // Poll input registers
+        try {
+            await this.#pollFloatsBlocks(device, 'inputRegs');
+        }
+        catch (err) {
+            if (this.#pollInterrupted) {
+                throw err;
+            }
+            pollErrors.push({ desc: 'pollFloatsBlocks', error: err });
+        }
+        // Poll holding registers
+        try {
+            await this.#pollFloatsBlocks(device, 'holdingRegs');
+        }
+        catch (err) {
+            if (this.#pollInterrupted) {
+                throw err;
+            }
+            pollErrors.push({ desc: 'pollFloatsBlocks', error: err });
+        }
+        // Cyclic write (cw) of holding registers.
+        // With maxBlock >= 2 all cyclic registers are written here once per poll cycle.
+        // With maxBlock < 2 (immediate-write mode) polled cyclic registers are already
+        // written right after their block read, so only the non-polled (CW-only) registers
+        // still need to be written here — otherwise cyclic write of unpolled registers would
+        // never run in immediate-write mode (issue #771).
+        if (device.holdingRegs.cyclicWrite?.length) {
+            const toWrite = this.options.config.maxBlock < 2
+                ? device.holdingRegs.cyclicWrite.filter(fullId => !this.objects[fullId]?.native?.poll)
+                : device.holdingRegs.cyclicWrite;
+            if (toWrite.length) {
+                try {
+                    operations++;
+                    await this.#writeFloatsRegs(toWrite);
+                    await this.#waitAsync(this.options.config.writeInterval);
+                }
+                catch (err) {
+                    pollErrors.push({ desc: 'writeFloatsRegs', error: err });
+                }
+            }
+        }
+        if (this.connected && !this.isStop) {
+            // If all polls failed, report error, otherwise report success
+            const allFailed = pollErrors.length === operations;
+            const error = allFailed ? pollErrors[0] : null; // Report first error if all failed
+            if (pollErrors.length && pollErrors.length < operations) {
+                this.adapter.log.warn(`[DevID_${device.coils.deviceId}] Some register types failed but continuing: ${pollErrors.length}/${operations} errors`);
+                // show errors
+                for (const err of pollErrors) {
+                    this.adapter.log.warn(`[DevID_${device.coils.deviceId}] ${err.desc}: ${(0, common_1.formatError)(err.error)}`);
+                }
+            }
+            const result = this.#pollResult(startTime, device.coils.deviceId, error?.error || null);
+            if (result) {
+                throw result;
+            }
+        }
+    }
+    async #poll() {
+        this.pollsRunning++;
+        try {
+            await this.#pollCycle();
+        }
+        finally {
+            this.pollsRunning--;
+        }
+    }
+    async #pollCycle() {
+        let anyError;
+        for (const id of this.deviceIds) {
+            if (this.#pollInterrupted) {
+                break;
+            }
+            try {
+                await this.#pollDevice(this.devices[id]);
+            }
+            catch (err) {
+                anyError = err;
+                if (this.#pollInterrupted) {
+                    break;
+                }
+            }
+            // Per-device wait time overrides the global one for this device (issue #605)
+            const waitTime = this.options.config.deviceTimeouts?.[id]?.waitTime ?? this.options.config.waitTime;
+            await this.#waitAsync(waitTime);
+        }
+        if (this.#pollInterrupted) {
+            return;
+        }
+        if (anyError) {
+            if (!this.reconnectTimeout) {
+                this.#reconnect();
+            }
+        }
+        else {
+            if (this.nextPoll) {
+                this.adapter.clearTimeout(this.nextPoll);
+                this.nextPoll = null;
+            }
+            this.nextPoll = this.adapter.setTimeout(() => {
+                this.nextPoll = null;
+                this.#poll().catch(e => this.adapter.log.error(`Cannot poll: ${e}`));
+            }, this.options.config.poll);
+        }
+    }
+    async #writeValue(id, val) {
+        const obj = this.objects[id];
+        if (!obj || !this.modbusClient) {
+            return;
+        }
+        const type = obj.native.regType;
+        const modbusClient = this.modbusClient;
+        // The value as the state shows it (before factor/offset), to confirm a register that is not polled
+        let stateVal = val;
+        try {
+            // The actual I/O, deferred so a failed write can be re-sent as a whole (see #retryable).
+            let doWrite;
+            if (type === 'coils') {
+                if (val === 'true' || val === true) {
+                    val = 1;
+                }
+                if (val === 'false' || val === false) {
+                    val = 0;
+                }
+                const coilVal = !!parseFloat(val);
+                stateVal = coilVal;
+                doWrite = () => modbusClient.writeSingleCoil(obj.native.deviceId, obj.native.address, coilVal);
+            }
+            else if (type === 'holdingRegs') {
+                if (obj.native.float === undefined) {
+                    obj.native.float =
+                        obj.native.type === 'floatle' ||
+                            obj.native.type === 'floatbe' ||
+                            obj.native.type === 'floatsw' ||
+                            obj.native.type === 'doublele' ||
+                            obj.native.type === 'doublebe' ||
+                            obj.native.type === 'floatsb';
+                }
+                if (!common_1.stringRegisterTypes.includes(obj.native.type)) {
+                    val = parseFloat(val);
+                    stateVal = val;
+                    val = (val - obj.native.offset) / obj.native.factor;
+                    if (!obj.native.float) {
+                        val = Math.round(val);
+                    }
+                }
+                if (!obj.native.type) {
+                    this.adapter.log.error('No type defined for write.');
+                    return;
+                }
+                // FC16
+                if (this.options.config.onlyUseWriteMultipleRegisters ||
+                    (obj.native.len > 1 && !this.options.config.doNotUseWriteMultipleRegisters)) {
+                    const hrBuffer = (0, common_1.writeValue)(obj.native.type, val, obj.native.len);
+                    doWrite = () => modbusClient.writeMultipleRegisters(obj.native.deviceId, obj.native.address, hrBuffer);
+                }
+                else {
+                    // FC06
+                    const buffer = (0, common_1.writeValue)(obj.native.type, val, 1);
+                    if (obj.native.len > 1) {
+                        doWrite = async () => {
+                            for (let r = 0; r < obj.native.len / 2; r++) {
+                                const subBuffer = buffer.subarray(r * 2, r * 2 + 2);
+                                await modbusClient.writeSingleRegister(obj.native.deviceId, obj.native.address + r, subBuffer);
+                                await this.#waitAsync(this.options.config.writeInterval);
+                            }
+                        };
+                    }
+                    else {
+                        doWrite = () => modbusClient.writeSingleRegister(obj.native.deviceId, obj.native.address, buffer);
+                    }
+                }
+            }
+            if (doWrite) {
+                // A failed write is re-sent up to `writeRetryCount` times (0 = no retries), same as a block read.
+                await this.#retryable(this.options.config.writeRetryCount ?? 0, err => `Cannot write value ${val} to ${id} (unit ${obj.native.deviceId}, ${type} address ${obj.native.address}): ${(0, common_1.formatError)(err)}`, doWrite);
+                // A register that is not polled is never read back: the written value is the known value. Without
+                // it the state was acknowledged with null and a cyclic write of the register stopped
+                if (!obj.native.poll && !(typeof stateVal === 'number' && isNaN(stateVal))) {
+                    this.ackObjects[id.substring(this.adapter.namespace.length + 1)] = { val: stateVal };
+                }
+            }
+            if (this.showDebug) {
+                this.adapter.log.debug(`Write successfully [${obj.native.address}]: ${val}`);
+            }
+        }
+        catch (err) {
+            // Name the target of the failed write; `Cannot write value 80: Error: timeout` alone does
+            // not say which register, device or function code was involved (issue #811)
+            this.adapter.log.warn(`Cannot write value ${val} to ${id} (unit ${obj.native.deviceId}, ${type} address ${obj.native.address}): ${(0, common_1.formatError)(err)}`);
+            // With keepConnectionOnTimeout a timeout does not mean, that the connection is gone: the
+            // `requestTimeout` handler reconnects when no device answers anymore (issue #832)
+            const keep = this.keepConnectionOnTimeout && !!err?.timeout;
+            if (!keep && !this.isStop && !this.reconnectTimeout) {
+                if (this.activeRetries > 0) {
+                    // a running retry owns the connection and reconnects before its next attempt
+                    this.reconnectRequested = true;
+                }
+                else {
+                    this.#reconnect(true);
+                }
+            }
+        }
+    }
+    /**
+     * Writes the values of the sendBuffer one after another. Only one call works at a time: a write that comes in
+     * meanwhile is taken by the running loop. "Write interval" is kept between two writes, also when the second one
+     * comes after the buffer was empty.
+     */
+    async #send() {
+        if (this.sending) {
+            return;
+        }
+        this.sending = true;
+        try {
+            while (!this.isStop && Object.keys(this.sendBuffer).length) {
+                if (!this.modbusClient) {
+                    this.adapter.log.error('Client not connected');
+                    return;
+                }
+                const wait = (this.options.config.writeInterval || 0) - (Date.now() - this.lastWrite);
+                if (wait > 0) {
+                    await this.#waitAsync(wait);
+                }
+                // taken after the wait, so a value written meanwhile to the same register is the one sent
+                const id = Object.keys(this.sendBuffer)[0];
+                const val = this.sendBuffer[id];
+                delete this.sendBuffer[id];
+                await this.#writeValue(id, val);
+                this.lastWrite = Date.now();
+            }
+        }
+        finally {
+            this.sending = false;
+        }
+    }
+    #writeHelper(id, state) {
+        this.sendBuffer[id] = state.val;
+        this.#send().catch(e => this.adapter.log.error(`Cannot send: ${e}`));
+    }
+    async write(id, state) {
+        if (!this.objects[id]?.native) {
+            this.adapter.log.error(`Can not set state ${id}: unknown object`);
+            return;
+        }
+        if (this.objects[id].native.regType === 'coils' || this.objects[id].native.regType === 'holdingRegs') {
+            if (!this.objects[id].native.wp) {
+                this.#writeHelper(id, state);
+                // TODO: may be here we should calculate options.config.readInterval too
+                await this.#waitAsync(this.options.config.poll * 1.5);
+                const _id = id.substring(this.adapter.namespace.length + 1);
+                // No known value (the write failed, nothing read yet): leave the state unacknowledged instead of null
+                if (this.ackObjects[_id]) {
+                    await this.adapter.setState(id, this.ackObjects[_id].val, true);
+                }
+            }
+            else {
+                if (this.pulseList[id] === undefined) {
+                    const _id = id.substring(this.adapter.namespace.length + 1);
+                    this.pulseList[id] = this.ackObjects[_id] ? this.ackObjects[_id].val : !state.val;
+                    this.#writeHelper(id, state);
+                    await this.#waitAsync(this.options.config.pulseTime);
+                    this.#writeHelper(id, { val: this.pulseList[id] });
+                    await this.#waitAsync(this.options.config.poll * 1.5);
+                    if (this.ackObjects[_id]) {
+                        await this.adapter.setState(id, this.ackObjects[_id].val, true);
+                    }
+                    delete this.pulseList[id];
+                }
+            }
+        }
+        else {
+            this.adapter.setTimeout(() => {
+                const _id = id.substring(this.adapter.namespace.length + 1);
+                void this.adapter.setState(id, this.ackObjects[_id] ? this.ackObjects[_id].val : null, true, err => 
+                // analyse if the state could be set (because of permissions)
+                err && this.adapter.log.error(`Can not set state ${id}: ${err}`));
+            }, 0);
+        }
+    }
+    start() {
+        if (this.modbusClient && typeof this.modbusClient.connect === 'function') {
+            try {
+                this.modbusClient.connect();
+            }
+            catch (e) {
+                this.adapter.log.error(`Can not open Modbus connection: ${e} . Please check your settings`);
+            }
+        }
+    }
+    close() {
+        this.isStop = true;
+        if (this.usedSerialPort) {
+            // The host releases the entries of a stopped instance by itself; this is for the case
+            // where the master is thrown away while the adapter keeps running, e.g. in proxy mode
+            void (0, usedResources_1.freeUsedResource)(this.adapter, 'serialPort', { port: this.usedSerialPort.port });
+            this.usedSerialPort = undefined;
+        }
+        if (this.reconnectTimeout) {
+            this.adapter.clearTimeout(this.reconnectTimeout);
+            this.reconnectTimeout = null;
+        }
+        if (this.connectTimer) {
+            this.adapter.clearTimeout(this.connectTimer);
+            this.connectTimer = null;
+        }
+        if (this.keepAliveTimeout) {
+            this.adapter.clearTimeout(this.keepAliveTimeout);
+            this.keepAliveTimeout = null;
+        }
+        if (this.nextPoll) {
+            this.adapter.clearTimeout(this.nextPoll);
+            this.nextPoll = null;
+        }
+        if (this.modbusClient) {
+            try {
+                this.modbusClient.close();
+            }
+            catch {
+                // ignore
+            }
+        }
+    }
+}
+exports.Master = Master;
+//# sourceMappingURL=Master.js.map

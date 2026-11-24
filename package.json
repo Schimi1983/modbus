@@ -1,6 +1,6 @@
 {
   "name": "@iobroker/modbus",
-  "version": "7.12.1",
+  "version": "7.12.1-test.0",
   "description": "Template for Modbus protocol in ioBroker",
   "publishConfig": {
     "access": "public"
@@ -53,7 +53,6 @@
     "LICENSE"
   ],
   "scripts": {
-    "prepare": "npm run build",
     "prepublishOnly": "npm run build",
     "lint": "eslint -c eslint.config.mjs",
     "test": "mocha",

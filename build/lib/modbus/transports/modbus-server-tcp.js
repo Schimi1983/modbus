@@ -1,0 +1,133 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const modbus_server_core_1 = __importDefault(require("../modbus-server-core"));
+const Put_1 = __importDefault(require("../../Put"));
+const node_net_1 = require("node:net");
+class ModbusServerTcp extends modbus_server_core_1.default {
+    server;
+    socketCount = 0;
+    fifo = [];
+    clients = [];
+    buffers = new WeakMap();
+    tcp;
+    constructor(options) {
+        super(options);
+        this.tcp = {
+            port: options.tcp.port || 502,
+            hostname: options.tcp.hostname || '0.0.0.0',
+        };
+        this.server = (0, node_net_1.createServer)();
+        this.server.on('connection', s => {
+            this.log.debug(`new connection ${JSON.stringify(s.address())}`);
+            this.clients.push(s);
+            this.#initiateSocket(s);
+            this.emit('connection', s.address());
+        });
+        this.server.on('disconnect', s => this.emit('close', s.address()));
+        this.server.on('error', (e) => {
+            // e.g. EACCES on a privileged port without cap_net_bind_service, or EADDRINUSE.
+            // Without this listener Node would throw, crashing the whole adapter.
+            this.log.error(`Modbus server error on ${this.tcp.hostname}:${this.tcp.port}: ${e.message}`);
+            this.emit('error', e);
+        });
+        this.server.listen(this.tcp.port, this.tcp.hostname, () => {
+            this.log.debug(`server is listening on port ${this.tcp.hostname}:${this.tcp.port}`);
+            // `connection` is one client, so the fact that the server itself is up needs an event of
+            // its own. The address is the one really bound, which is what the registry of used
+            // resources wants - a configured port 0 would have become a random one here.
+            this.emit('listening', this.server.address());
+        });
+        this.on('newState_ready', this.#flush);
+        this.setState('ready');
+    }
+    #onSocketData = (socket) => {
+        return (data) => {
+            let buffer = this.buffers.get(socket) || Buffer.alloc(0);
+            buffer = Buffer.concat([buffer, data]);
+            while (buffer.length > 8) {
+                // 1. extract mbap
+                const len = buffer.readUInt16BE(4);
+                const request = {
+                    transId: buffer.readUInt16BE(0),
+                    protocolVer: buffer.readUInt16BE(2),
+                    unitId: buffer.readUInt8(6),
+                };
+                // 2. extract pdu
+                if (buffer.length < 7 + len - 1) {
+                    break; // wait for next bytes
+                }
+                const pdu = buffer.slice(7, 7 + len - 1);
+                // emit data event and let the
+                // listener handle the pdu
+                this.fifo.push({ request, pdu, socket });
+                this.#flush();
+                buffer = buffer.slice(pdu.length + 7, buffer.length);
+            }
+            this.buffers.set(socket, buffer);
+        };
+    };
+    #flush = () => {
+        if (this.inState('processing')) {
+            return;
+        }
+        if (!this.fifo.length) {
+            return;
+        }
+        this.setState('processing');
+        const current = this.fifo.shift();
+        this.onData(current.pdu, response => {
+            this.log.debug('sending tcp data');
+            const pkt = new Put_1.default()
+                .word16be(current.request.transId) // transaction id
+                .word16be(current.request.protocolVer) // protocol version
+                .word16be(response.length + 1) // pdu length
+                .word8(current.request.unitId) // unit id
+                .put(response) // the actual pdu
+                .buffer();
+            current.socket.write(pkt);
+            this.setState('ready');
+        }, 
+        // The unit ID selects the served device: with several device IDs every unit gets its own
+        // register space instead of all of them sharing the first device's buffers (issue #813)
+        current.request.unitId);
+    };
+    #initiateSocket = (socket) => {
+        this.socketCount += 1;
+        socket.on('data', this.#onSocketData(socket));
+        socket.on('error', e => {
+            this.emit('error', e);
+            this.log.error(`Socket error ${e}`);
+        });
+        // 'close' fires on every termination (clean FIN, error, or abrupt network/VPN drop),
+        // whereas 'end' only fires on a clean FIN from the peer. Removing the socket here keeps
+        // this.clients from accumulating stale entries that would otherwise be listed forever.
+        socket.on('close', () => {
+            const pos = this.clients.indexOf(socket);
+            if (pos !== -1) {
+                this.clients.splice(pos, 1);
+            }
+            this.log.debug(`connection closed, socket ${JSON.stringify(socket.address())}`);
+            this.emit('close');
+        });
+    };
+    close(cb) {
+        for (const socket of this.clients) {
+            socket?.destroy();
+        }
+        this.server.close(() => {
+            this.server.unref();
+            cb?.();
+        });
+    }
+    getClients() {
+        // remoteAddress is the connected master (peer); address() would return the local server address.
+        // De-duplicate so multiple sessions from the same master appear once instead of e.g. "10.8.0.2,10.8.0.2".
+        const addresses = (this.clients || []).map(it => it?.remoteAddress).filter((it) => !!it);
+        return [...new Set(addresses)];
+    }
+}
+exports.default = ModbusServerTcp;
+//# sourceMappingURL=modbus-server-tcp.js.map

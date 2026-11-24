@@ -1,0 +1,527 @@
+/** Definitions for Modbus adapter for ioBroker */
+
+/** Data types for registers */
+export type RegisterEntryType =
+    | ''
+    | 'string'
+    | 'stringle'
+    | 'string16'
+    | 'string16le'
+    | 'rawhex'
+    | 'uint16be'
+    | 'uint16le'
+    | 'int16be'
+    | 'int16le'
+    | 'uint8be'
+    | 'uint8le'
+    | 'int8be'
+    | 'int8le'
+    // signed int8 sign-extended into the full 16-bit register (pad byte = sign), unlike int8be/int8le
+    // which zero-pad. Out-of-range values (< -128 / > 127) are rejected with a warning, not wrapped.
+    | 'signExtendedInt8be'
+    | 'signExtendedInt8le'
+    | 'uint32be'
+    | 'uint32le'
+    | 'uint32sw'
+    | 'uint32sb'
+    | 'int32be'
+    | 'int32le'
+    | 'int32sw'
+    | 'int32sb'
+    | 'int64be'
+    | 'int64le'
+    | 'floatbe'
+    | 'floatle'
+    | 'floatsw'
+    | 'floatsb'
+    | 'uint64be'
+    | 'uint64le'
+    // 64-bit integers rendered as a decimal string to preserve the full range beyond 2^53
+    | 'int64bestr'
+    | 'int64lestr'
+    | 'uint64bestr'
+    | 'uint64lestr'
+    | 'doublebe'
+    | 'doublele';
+
+/** Definition of one Modbus register */
+export interface Register {
+    /** Parsed numeric address of the register */
+    address: number;
+    /** Raw address as entered by the user (maybe a string like "0" or a number) */
+    _address: string | number;
+    /** Modbus device/unit ID. Used when multiDeviceId is enabled */
+    deviceId?: string | number;
+    /** Name of the register, used to build the ioBroker state ID */
+    name: string;
+    /** Human-readable description of the register */
+    description?: string;
+    /** JavaScript formula for value transformation, e.g. `"x * sf['40065'] + 50"`. `x` is the raw value, `sf` is the scale-factor map */
+    formula?: string;
+    /** ioBroker role for the created state object, e.g. `"level"`, `"value.temperature"` */
+    role?: string;
+    /** Unit of measurement, e.g. `"°C"`, `"kWh"` */
+    unit?: string;
+    /** Room assignment for the state (enum) */
+    room?: string;
+    /** If true, this register is included in the cyclic poll (used for coils and holding registers) */
+    poll?: boolean;
+    /** Write-pulse: if true, the coil is written as a pulse with the configured pulse time */
+    wp?: boolean;
+    /** Read-poll: if true, this register is polled for reading */
+    rp?: boolean;
+    /** Cyclic-write: if true, the holding register value is re-written on every poll cycle */
+    cw?: boolean;
+    /** Read-calculate: if true, the value is calculated from a formula on each read */
+    rc?: boolean;
+    /** Number of Modbus registers (16-bit words) this entry occupies. Default is 1 */
+    len?: number | string;
+    /** Data type for encoding/decoding the register value, e.g. `"uint16be"`, `"floatbe"`, `"string"` */
+    type: RegisterEntryType;
+    /** Multiplication factor applied to the raw value: `result = raw * factor + offset` */
+    factor?: number | string;
+    /** Additive offset applied after the factor: `result = raw * factor + offset` */
+    offset?: number | string;
+    /** If true, this register stores a dynamic scale factor used in formulas of other registers via `sf[address]` */
+    isScale?: boolean;
+    /** Enable value sanitization for invalid values (NaN, Infinity, extreme floats) */
+    sanitize?: boolean;
+    /** Action to take when an invalid value is detected */
+    sanitizeAction?: 'keepLastValid' | 'replaceWithZero';
+    /** Minimum valid value threshold (optional) */
+    minValidValue?: number | string;
+    /** Maximum valid value threshold (optional) */
+    maxValidValue?: number | string;
+}
+
+export interface RegisterInternal extends Omit<Register, '_address' | 'len' | 'factor' | 'offset'> {
+    _address: number;
+    id: string;
+    fullId: string;
+    len: number;
+    offset: number;
+    factor: number;
+}
+export type RegisterType = 'disInputs' | 'coils' | 'inputRegs' | 'holdingRegs';
+export type ModbusTransport = 'tcp' | 'udp' | 'serial' | 'tcprtu' | 'tcp-ssl';
+
+interface DeviceOption {
+    fullIds: string[];
+    addressHigh: number;
+    addressLow: number;
+    length: number;
+    offset: number;
+    config: RegisterInternal[];
+}
+
+export interface DeviceSlaveOption extends DeviceOption {
+    changed: boolean;
+    values: (number | boolean)[];
+    mapping: { [address: number]: string };
+
+    lastStart?: number;
+    lastEnd?: number;
+}
+
+export interface DeviceMasterOption extends DeviceOption {
+    deviceId: number;
+    blocks: { start: number; count: number; startIndex: number; endIndex: number }[];
+    // IDs of the objects that must be cyclically written (full ID)
+    cyclicWrite?: string[];
+}
+
+export type MasterDevice = {
+    disInputs: DeviceMasterOption;
+    coils: DeviceMasterOption;
+    inputRegs: DeviceMasterOption;
+    holdingRegs: DeviceMasterOption;
+};
+
+export type SlaveDevice = {
+    disInputs: DeviceSlaveOption;
+    coils: DeviceSlaveOption;
+    inputRegs: DeviceSlaveOption;
+    holdingRegs: DeviceSlaveOption;
+};
+
+/** In proxy mode every register block carries BOTH the master polling structures and the slave serving buffer */
+export interface DeviceProxyOption extends DeviceMasterOption, DeviceSlaveOption {}
+
+export type ProxyDevice = {
+    disInputs: DeviceProxyOption;
+    coils: DeviceProxyOption;
+    inputRegs: DeviceProxyOption;
+    holdingRegs: DeviceProxyOption;
+};
+
+export interface Options {
+    config: {
+        type: ModbusTransport;
+        slave: boolean;
+        alwaysUpdate: boolean;
+        round: number;
+        timeout: number;
+        defaultDeviceId: number;
+        doNotIncludeAdrInId: boolean;
+        preserveDotsInId: boolean;
+        writeInterval: number;
+        doNotUseWriteMultipleRegisters: boolean;
+        onlyUseWriteMultipleRegisters: boolean;
+        multiDeviceId?: boolean;
+        /**
+         * Per-device settings, keyed by Modbus device/unit ID (issue #605).
+         * `timeout` overrides the global `timeout`, `waitTime` overrides the global `waitTime` for that device.
+         */
+        deviceTimeouts?: { [deviceId: number]: { timeout?: number; waitTime?: number } };
+
+        /** Proxy mode: poll as master AND expose the polled data via a built-in Modbus TCP slave server */
+        proxy?: boolean;
+        /** TCP server endpoint of the built-in slave in proxy mode (separate from the master client endpoint) */
+        proxyTcp?: {
+            port: number;
+            ip?: string;
+        };
+
+        // Only for master
+        poll?: number;
+        recon?: number;
+        /**
+         * Number of times a failed (timed-out / connection-lost) block read is re-attempted before
+         * giving up on that block. Each retry re-sends the same request; the connection is only
+         * re-established if it actually dropped. Clamped to 0..3. 0 = no retries (original behaviour).
+         */
+        readRetryCount?: number;
+        /** Number of times a failed write is re-attempted before giving up. Clamped to 0..3. 0 = no retries (original behaviour) */
+        writeRetryCount?: number;
+        /** Delay in ms to wait before each retry resend (master mode). Default: 100 */
+        retryInterval?: number;
+        maxBlock?: number;
+        maxBoolBlock?: number;
+        /** Max address gap (in registers/bits) bridged when merging registers into one read request. 0 = read only contiguous configured registers (issue #581) */
+        maxGap?: number;
+        pulseTime?: number;
+        waitTime?: number;
+        readInterval?: number;
+        keepAliveInterval?: number;
+        disableLogging?: boolean;
+        /** Enable automatic sanitization of invalid register values */
+        enableSanitization?: boolean;
+        /** TCP, SSL, UDP: accept a response with any transaction ID, for devices that do not echo it (issue #829) */
+        ignoreTransactionId?: boolean;
+        /** TCP, SSL, UDP master: a timeout fails only its request, the connection stays open (issue #832) */
+        keepConnectionOnTimeout?: boolean;
+
+        // Only for slave — read-notify feature
+        /** Expire time in seconds for counter-mode read-notify states; 0 = no expire */
+        notifyOnReadExpire?: number;
+        notifyOnReadCoils?: boolean;
+        notifyOnReadDisInputs?: boolean;
+        notifyOnReadInputRegs?: boolean;
+        notifyOnReadHoldingRegs?: boolean;
+
+        tcp?: {
+            port: number;
+            ip?: string;
+        };
+
+        ssl?: {
+            rejectUnauthorized: boolean;
+            key: string;
+            cert: string;
+            ca?: string;
+        };
+
+        serial?: {
+            comName: string;
+            baudRate: number;
+            dataBits: 5 | 6 | 7 | 8;
+            stopBits: 1 | 2;
+            parity: 'none' | 'even' | 'mark' | 'odd' | 'space';
+        };
+    };
+    devices: {
+        [deviceId: number]: MasterDevice | SlaveDevice | ProxyDevice;
+    };
+    objects: { [id: string]: ioBroker.StateObject | null | undefined };
+}
+
+/** Modbus adapter parameters as stored in the adapter configuration (all optional; values may be strings from the UI) */
+export interface ModbusParameters {
+    /** Transport type: TCP, Serial, TCP-RTU, or TCP with SSL. Default: `"tcp"` */
+    type?: ModbusTransport;
+    /** TCP bind address for slave mode */
+    bind?: string;
+    /** TCP host/IP address to connect to (master mode) */
+    host?: string;
+    /** TCP port number. Default: 502 */
+    port?: number | string;
+    /** How the serial device is chosen: by fixed port path (`port`) or by stable USB device ID (`device`). Default: `"port"` */
+    selectBy?: 'port' | 'device';
+    /** Serial port name, e.g. `"/dev/ttyUSB0"` or `"COM3"` */
+    comName?: string;
+    /** Stable USB device identifier in the form `vendorId:productId:serialNumber`, used when `selectBy` is `"device"` */
+    comDeviceId?: string;
+    /** Serial baud rate, e.g. 9600, 19200, 115200 */
+    baudRate?: number;
+    /** Serial data bits: 5, 6, 7, or 8 */
+    dataBits?: 5 | 6 | 7 | 8 | string;
+    /** Serial stop bits: 1 or 2 */
+    stopBits?: 1 | 2 | string;
+    /** Serial parity mode */
+    parity?: 'none' | 'even' | 'mark' | 'odd' | 'space';
+    /** Default Modbus device/unit ID */
+    deviceId?: number | string | null;
+    /** Timeout of one read/write cycle in ms */
+    timeout?: number | string;
+    /** Adapter role: `"0"` = master, `"1"` = slave. Default: `"0"` (master) */
+    slave?: '0' | '1';
+    /** Proxy mode (master only): poll as master and additionally serve the same data as a Modbus TCP slave */
+    proxy?: boolean | 'true';
+    /** TCP bind address for the built-in slave server in proxy mode. Default: `"0.0.0.0"` */
+    proxyBind?: string;
+    /** TCP port for the built-in slave server in proxy mode. Default: 502 */
+    proxyPort?: number | string;
+    /** Poll interval in ms (master mode). Default: 1000 */
+    poll?: number | string;
+    /** Reconnect interval in ms after connection loss (master mode) */
+    recon?: number | string;
+    /** Number of times a failed block read is re-attempted before giving up (clamped to 0..3, master mode). Default 0 */
+    readRetryCount?: number | string;
+    /** Number of times a failed write is re-attempted before giving up (clamped to 0..3, master mode). Default 0 */
+    writeRetryCount?: number | string;
+    /** Delay in ms to wait before each retry resend (master mode). Default 100 */
+    retryInterval?: number | string;
+    /** Keep-alive interval in ms (master mode, TCP) */
+    keepAliveInterval?: number | string;
+    /** Maximum number of registers to read in one block (master mode) */
+    maxBlock?: number | string;
+    /** Maximum number of boolean (coil/discrete input) registers to read in one block (master mode) */
+    maxBoolBlock?: number | string;
+    /** Max address gap (in registers/bits) bridged when merging registers into one read request; 0 = only contiguous configured registers (master mode). Default 10 */
+    maxGap?: number | string;
+    /** Enable multiple device IDs — each register can specify its own deviceId */
+    multiDeviceId?: boolean | 'true';
+    /** Pulse time for coil writes in ms (master mode) */
+    pulseTime?: number | string;
+    /** Wait time between two Modbus requests in ms (master mode) */
+    waitTime?: number | string;
+    /** Address offset for discrete inputs. Default: 10001 */
+    disInputsOffset?: number | string;
+    /** Address offset for coils. Default: 1 */
+    coilsOffset?: number | string;
+    /** Address offset for input registers. Default: 30001 */
+    inputRegsOffset?: number | string;
+    /** Address offset for holding registers. Default: 40001 */
+    holdingRegsOffset?: number | string;
+    /** Show Modbus aliases instead of zero-based addresses (e.g. 40001 instead of 0) */
+    showAliases?: boolean | 'true';
+    /** Use direct addresses for binary registers (coils/discrete inputs) */
+    directAddresses?: boolean | 'true';
+    /** Do not include the register address in the ioBroker state ID */
+    doNotIncludeAdrInId?: boolean | 'true';
+    /** Remove the leading underscore from state names (only when doNotIncludeAdrInId is true) */
+    removeUnderscorePrefix?: boolean | 'true';
+    /** Zero-pad the address in the state ID to 5 digits, so IDs sort numerically. Changing it renames the state IDs */
+    padAddressInId?: boolean | 'true';
+    /** Preserve dots in the state ID instead of replacing them with underscores */
+    preserveDotsInId?: boolean | 'true';
+    /** Include the register type in the state name. If a string, used as a channel name */
+    registerTypeInName?: boolean | string;
+    /** Number of decimal digits for rounding values. 0 means integer */
+    round?: number | string;
+    /** If true, update the state on every poll even if the value has not changed */
+    alwaysUpdate?: boolean;
+    /** Do not round register addresses to the next word boundary for multi-word registers */
+    doNotRoundAddressToWord?: boolean | 'true';
+    /** Disable WriteMultipleRegisters (FC16) — use WriteSingleRegister (FC06) instead */
+    doNotUseWriteMultipleRegisters?: boolean | 'true';
+    /** Only use WriteMultipleRegisters (FC16) for all holding register writes */
+    onlyUseWriteMultipleRegisters?: boolean | 'true';
+    /** Interval in ms to check for queued write operations (master mode) */
+    writeInterval?: number | string;
+    /** Interval in ms between read cycles (master mode). 0 = continuous polling */
+    readInterval?: number | string;
+    /** Disable connection error logging */
+    disableLogging?: boolean;
+    /** Name of the private key certificate for SSL/TLS connections */
+    certPrivate?: string;
+    /** Name of the public certificate for SSL/TLS connections */
+    certPublic?: string;
+    /** Name of the chained/CA certificate for SSL/TLS connections */
+    certChained?: string;
+    /** Allow self-signed certificates for SSL/TLS connections */
+    sslAllowSelfSigned?: boolean;
+    /** Enable automatic sanitization of invalid register values (NaN, Infinity, extreme floats, out-of-range) */
+    enableSanitization?: boolean;
+    /**
+     * TCP, SSL, UDP master: accept a response with any transaction ID. Only for devices that do not echo
+     * the transaction ID of the request - otherwise a stale or duplicated answer is taken for the next
+     * request and the registers of another block are stored (issue #829)
+     */
+    ignoreTransactionId?: boolean | 'true';
+    /**
+     * TCP, SSL, UDP master: a timeout fails only its request, the connection stays open. For gateways with
+     * several devices behind them, where one device does not answer for a while (issue #832). The
+     * connection is still closed on a socket error and when no device answers anymore. Has no effect
+     * together with `ignoreTransactionId`: then a late answer could be taken for the next request.
+     */
+    keepConnectionOnTimeout?: boolean | 'true';
+
+    // Slave mode — read-notify feature
+    /** Expire time in seconds for counter-mode states; 0 or omitted = no expire */
+    notifyOnReadExpire?: number | string;
+    /** Emit read-notify states for coils (FC1) */
+    notifyOnReadCoils?: boolean;
+    /** Emit read-notify states for discrete inputs (FC2) */
+    notifyOnReadDisInputs?: boolean;
+    /** Emit read-notify states for input registers (FC4) */
+    notifyOnReadInputRegs?: boolean;
+    /** Emit read-notify states for holding registers (FC3) */
+    notifyOnReadHoldingRegs?: boolean;
+}
+
+export interface ModbusParametersTyped extends ModbusParameters {
+    /** Slave (1) or Master (0) */
+    slave: '0' | '1'; // default master
+    /** Transport type */
+    type: ModbusTransport; // default tcp
+
+    /** TCP IP bind is 'tcp', 'tcprtu' or 'tcp-ssl' and slave */
+    bind: string;
+    /** TCP port if the type is 'tcp', 'tcprtu' or 'tcp-ssl' */
+    port: number | string;
+    /** TCP host if the type is 'tcp', 'tcprtu' or 'tcp-ssl' and master */
+    host: string;
+    /** Private key for SSL connection if the type is 'tcp-ssl' */
+    certPrivate: string;
+    /** Public certificate for SSL connection if the type is 'tcp-ssl' */
+    certPublic: string;
+    /** Chained certificate for SSL connection if the type is 'tcp-ssl' */
+    certChained: string;
+    /** Allow self-signed certificates for SSL connection if the type is 'tcp-ssl' */
+    sslAllowSelfSigned: boolean;
+
+    /** How the serial device is chosen if the type is 'serial': by fixed port path (`port`) or by stable USB device ID (`device`) */
+    selectBy: 'port' | 'device';
+    /** Serial port name if the type is 'serial' */
+    comName: string;
+    /** Stable USB device identifier (`vendorId:productId:serialNumber`) if the type is 'serial' and `selectBy` is `"device"` */
+    comDeviceId: string;
+    /** Serial baud rate if the type is 'serial' */
+    baudRate: number | string;
+    /** Serial data bits if the type is 'serial' */
+    dataBits: 5 | 6 | 7 | 8 | string;
+    /** Serial stop bits if the type is 'serial' */
+    stopBits: 1 | 2 | string;
+    /** Serial parity if the type is 'serial' */
+    parity: 'none' | 'even' | 'mark' | 'odd' | 'space';
+
+    /** Default device ID */
+    deviceId: number | string | null;
+
+    /** Maximum number of registers to read in one block (for master) */
+    maxBlock: number | string;
+    /** Maximum number of boolean registers to read in one block (for master) */
+    maxBoolBlock: number | string;
+    /** Max address gap (in registers/bits) bridged when merging registers into one read request; 0 = only contiguous configured registers (for master) */
+    maxGap: number | string;
+    /** Use multiple device IDs (for master) */
+    multiDeviceId: boolean | 'true';
+
+    /** Timeout of one read/write cycle in ms */
+    timeout: number | string;
+    /** Poll interval in ms (for master) */
+    poll: number | string;
+    /** Reconnect interval in ms (for master) */
+    recon: number | string;
+    /** Number of times a failed block read is re-attempted before giving up (0..3, for master). Default 0 */
+    readRetryCount: number | string;
+    /** Number of times a failed write is re-attempted before giving up (0..3, for master). Default 0 */
+    writeRetryCount: number | string;
+    /** Delay in ms to wait before each retry resend (for master). Default 100 */
+    retryInterval: number | string;
+    /** The keep-alive interval in ms (for master and tcp) */
+    keepAliveInterval: number | string;
+    /** Pulse time for coils in ms (for master and write) */
+    pulseTime: number | string;
+    /** Wait time between two requests in ms (for master) */
+    waitTime: number | string;
+
+    /** Interval in ms to check for values to write (for master and write) */
+    writeInterval: number | string;
+    /** Interval in ms to read registers (for master and read) */
+    readInterval: number | string;
+
+    /** Offset for discrete inputs. Default 10001 */
+    disInputsOffset: number | string;
+    /** Offset for coils. Default 00001 */
+    coilsOffset: number | string;
+    /** Offset for input registers. Default 30001 */
+    inputRegsOffset: number | string;
+    /** Offset for holding registers. Default 40001 */
+    holdingRegsOffset: number | string;
+
+    /** Show aliases instead of addresses. If true, the address will be 40001 and not 0 */
+    showAliases: boolean | 'true';
+    /** For binary registers */
+    directAddresses: boolean | 'true';
+    /**
+     * Do not include the address in the ID.
+     * The name will be "_PV_consumption" and not "40001_PV_consumption".
+     * To remove the leading "_", activate removeUnderscorePrefix attribute.
+     * This is only active if `showAliases` is false.
+     */
+    doNotIncludeAdrInId: boolean | 'true';
+    /** If doNotIncludeAdrInId is true, remove the leading "_" */
+    removeUnderscorePrefix: boolean | 'true';
+    /** Zero-pad the address in the ID to 5 digits (e.g. "00011_Name" instead of "11_Name"). Changing it renames the IDs */
+    padAddressInId?: boolean | 'true';
+    /** Preserve dots in ID, else they will be replaced with "_" */
+    preserveDotsInId: boolean | 'true';
+    /** No register type in name if `true` or channel name as string */
+    registerTypeInName?: boolean | string;
+    /** Do not round address to the next word for registers with len > 1 */
+    doNotRoundAddressToWord: boolean | 'true';
+
+    /** Number of digits after comma to round the value. 0 means integer */
+    round: number | string;
+    /** If alwaysUpdate is true, the value will be written even if it is the same as before */
+    alwaysUpdate: boolean;
+    /** Do not use WriteMultipleRegisters (FC16) function for writing holding registers */
+    doNotUseWriteMultipleRegisters: boolean | 'true';
+    /** Only use WriteMultipleRegisters (FC16) function for writing holding registers */
+    onlyUseWriteMultipleRegisters: boolean | 'true';
+
+    /** Disable logging of errors and info */
+    disableLogging: boolean;
+    /** Enable automatic sanitization of invalid register values */
+    enableSanitization?: boolean;
+    /** TCP, SSL, UDP master: accept a response with any transaction ID, for devices that do not echo it */
+    ignoreTransactionId?: boolean | 'true';
+    /** TCP, SSL, UDP master: a timeout fails only its request, the connection stays open (issue #832) */
+    keepConnectionOnTimeout?: boolean | 'true';
+
+    // Slave mode — read-notify feature
+    notifyOnReadExpire?: number | string;
+    notifyOnReadCoils?: boolean;
+    notifyOnReadDisInputs?: boolean;
+    notifyOnReadInputRegs?: boolean;
+    notifyOnReadHoldingRegs?: boolean;
+}
+
+export interface ModbusAdapterConfig extends ioBroker.AdapterConfig {
+    /** Configuration of the adapter */
+    params: ModbusParametersTyped;
+
+    /** Definition of the registers */
+    disInputs: Register[];
+    coils: Register[];
+    inputRegs: Register[];
+    holdingRegs: Register[];
+
+    /**
+     * Per-device settings, keyed by Modbus device/unit ID (issue #605).
+     * Only used in master mode with `multiDeviceId`; `timeout`/`waitTime` override the global values for the given device.
+     */
+    deviceTimeouts?: { [deviceId: string]: { timeout?: number; waitTime?: number } };
+}
